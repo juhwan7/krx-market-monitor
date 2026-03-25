@@ -12,26 +12,39 @@ HEADERS = {
     "Referer": "https://finance.naver.com/"
 }
 
+# 💡 모든 과정을 기록할 일기장
+debug_logs = []
+
 def get_index_data(symbol):
-    """네이버 차트용 JSON API를 호출하여 방화벽을 완벽 우회합니다."""
+    debug_logs.append(f"\n🔍 [{symbol} 지수 추적]")
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now.strftime("%Y%m%d")
     
-    # KOSPI / KOSDAQ 분봉 데이터를 가져오는 API 엔드포인트
     url = f"https://api.finance.naver.com/siseJson.naver?symbol={symbol}&requestType=1&startTime={today_str}090000&endTime={today_str}153000&timeframe=minute"
     
     try:
         res = requests.get(url, headers=HEADERS, timeout=5)
-        # Javascript 배열 형태를 Python에서 읽을 수 있는 JSON으로 변환
-        text = res.text.strip().replace("'", '"')
-        data = json.loads(text)
+        debug_logs.append(f"└ 상태코드: {res.status_code}")
+        
+        raw_text = res.text.strip()
+        # 원본 데이터의 앞 100글자만 짤라서 기록
+        debug_logs.append(f"└ 응답 텍스트(앞100자): {raw_text[:100]}")
+        
+        text = raw_text.replace("'", '"')
+        try:
+            data = json.loads(text)
+            debug_logs.append(f"└ JSON 파싱 성공 (데이터 갯수: {len(data)})")
+        except Exception as e:
+            debug_logs.append(f"└ ❌ JSON 파싱 실패: {e}")
+            return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": "JSON 파싱 에러"}
         
         if len(data) <= 1:
+            debug_logs.append(f"└ ❌ 유효한 데이터가 없음 (배열이 비어있음)")
             return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": "장 시작 전이거나 데이터 없음"}
             
-        # data[0]은 컬럼명, data[1:]부터 실제 분봉 데이터
         records = data[1:]
-        current_price = float(records[-1][4]) # 4번째 인덱스가 종가(현재가)
+        current_price = float(records[-1][4])
+        debug_logs.append(f"└ 최근 추출시간: {records[-1][0]}, 현재가: {current_price}")
         
         target_30m = (now - datetime.timedelta(minutes=30)).strftime("%Y%m%d%H%M")
         target_1h = (now - datetime.timedelta(minutes=60)).strftime("%Y%m%d%H%M")
@@ -39,13 +52,14 @@ def get_index_data(symbol):
         price_30m = current_price
         price_1h = current_price
         
-        # 뒤에서부터 과거로 거슬러 올라가며 시간 매칭
         for row in reversed(records):
             time_str = str(row[0])
             if time_str <= target_30m and price_30m == current_price:
                 price_30m = float(row[4])
             if time_str <= target_1h and price_1h == current_price:
                 price_1h = float(row[4])
+                
+        debug_logs.append(f"└ 30분전 매칭가: {price_30m}, 1시간전 매칭가: {price_1h}")
                 
         return {
             "current": current_price,
@@ -54,40 +68,56 @@ def get_index_data(symbol):
             "error": ""
         }
     except Exception as e:
+        debug_logs.append(f"└ 💥 치명적 에러 발생: {e}")
         return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": f"API 에러: {e}"}
 
 def get_program_data():
-    """세션(Session)을 유지하여 쿠키를 발급받아 방화벽을 우회합니다."""
+    debug_logs.append(f"\n🔍 [프로그램 매매 추적]")
     url_program = "https://finance.naver.com/sise/sise_program.naver"
     kospi_val = 0
     kosdaq_val = 0
     error_msg = ""
     
     try:
-        # 1. 세션 열기 및 네이버 증권 메인 방문 (정상 유저 쿠키 획득)
         session = requests.Session()
         session.get("https://finance.naver.com/", headers=HEADERS, timeout=5)
         
-        # 2. 획득한 쿠키를 들고 프로그램 매매 페이지 접근
         res = session.get(url_program, headers=HEADERS, timeout=5)
         res.encoding = 'euc-kr'
-        soup = BeautifulSoup(res.text, 'html.parser')
+        debug_logs.append(f"└ 상태코드: {res.status_code}")
         
         if "error_content" in res.text:
-            return {"KOSPI": 0, "KOSDAQ": 0, "error": "쿠키 우회 실패 (WAF 강력 차단)"}
+            debug_logs.append("└ ❌ 방화벽 에러 페이지(error_content) 감지됨")
+            return {"KOSPI": 0, "KOSDAQ": 0, "error": "WAF 강력 차단"}
             
-        for table in soup.find_all('table'):
+        soup = BeautifulSoup(res.text, 'html.parser')
+        tables = soup.find_all('table')
+        debug_logs.append(f"└ 페이지 내 테이블 수: {len(tables)}")
+        
+        found = False
+        for table in tables:
             for row in table.find_all('tr'):
                 cols = row.find_all(['th', 'td'])
                 if len(cols) >= 7:
                     texts = [c.text.strip().replace(',', '') for c in cols]
                     if '거래소' in texts[0] or '코스피' in texts[0]:
-                        try: kospi_val = round(int(texts[6]) / 100)
+                        try:
+                            kospi_val = round(int(texts[6]) / 100)
+                            found = True
                         except: pass
                     elif '코스닥' in texts[0]:
-                        try: kosdaq_val = round(int(texts[6]) / 100)
+                        try:
+                            kosdaq_val = round(int(texts[6]) / 100)
+                            found = True
                         except: pass
+        
+        if found:
+            debug_logs.append(f"└ 파싱 완료: 코스피 {kospi_val}억, 코스닥 {kosdaq_val}억")
+        else:
+            debug_logs.append("└ ❌ 테이블은 찾았으나 '거래소/코스닥' 단어를 못 찾음")
+            
     except Exception as e:
+        debug_logs.append(f"└ 💥 치명적 에러 발생: {e}")
         error_msg = str(e)
 
     return {"KOSPI": kospi_val, "KOSDAQ": kosdaq_val, "error": error_msg}
@@ -110,15 +140,11 @@ def format_message():
     msg += f"- 코스피: `{program_data['KOSPI']:+,d}억`\n"
     msg += f"- 코스닥: `{program_data['KOSDAQ']:+,d}억`\n"
     
-    errors = []
-    if kospi_data.get('error'): errors.append(f"코스피: {kospi_data['error']}")
-    if kosdaq_data.get('error'): errors.append(f"코스닥: {kosdaq_data['error']}")
-    if program_data.get('error'): errors.append(f"프로그램: {program_data['error']}")
-    
-    if errors:
-        msg += "\n⚠️ *일부 데이터 수집 실패*\n" + "\n".join(errors)
-    else:
-        msg += "\n💡 프로그램 매도 폭탄이 떨어질 때가 눌림 타점의 기회일 수 있습니다!"
+    # 💡 하단에 CCTV 로그 추가
+    msg += "\nㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ\n"
+    msg += "🛠️ *상세 디버깅 로그 (CCTV)*\n```text"
+    msg += "\n".join(debug_logs)
+    msg += "\n```"
         
     return msg
 
