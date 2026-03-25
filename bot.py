@@ -2,82 +2,94 @@ import os
 import datetime
 import requests
 import yfinance as yf
-from bs4 import BeautifulSoup
 import pandas as pd
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
-def get_market_data():
-    """야후 파이낸스를 통해 지수와 글로벌 지표를 1순위로 가져옵니다."""
-    tickers = {
-        'KOSPI': '^KS11', 'KOSDAQ': '^KQ11', 
-        '환율': 'KRW=X', '나스닥선물': 'NQ=F', 
-        'VIX': '^VIX', '금': 'GC=F'
-    }
+def get_investor_data(market_code):
+    """
+    1안: 네이버 내부 데이터 API 직접 호출 (웹페이지보다 차단이 덜함)
+    2안: Daum 금융 API (해외 IP 차단 없음)
+    """
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    # 네이버 내부 API 경로 (KOSPI: '0', KOSDAQ: '1')
+    biz_type = '0' if market_code == 'KOSPI' else '1'
+    
+    # 1안: 네이버 내부 API 시도
+    try:
+        url = f"https://finance.naver.com/sise/investorDealTrendTime.naver?biztype={biz_type}&page=1"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+        res = requests.get(url, headers=headers, timeout=5)
+        dfs = pd.read_html(res.text, thousands=',')
+        df = dfs[0].dropna()
+        
+        # 시간, 개인, 외인, 기관 컬럼 추출
+        data = df.iloc[:, [0, 1, 2, 3]]
+        data.columns = ['time', 'retail', 'foreign', 'inst']
+        
+        current = data.iloc[0]
+        p30 = data.iloc[min(len(data)-1, 3)] # 약 30분 전
+        p60 = data.iloc[min(len(data)-1, 6)] # 약 60분 전
+        
+        return {
+            'cur': current,
+            'd30': {'r': current['retail']-p30['retail'], 'f': current['foreign']-p30['foreign'], 'i': current['inst']-p60['inst']},
+            'd60': {'r': current['retail']-p60['retail'], 'f': current['foreign']-p60['foreign'], 'i': current['inst']-p60['inst']}
+        }
+    except:
+        # 2안: Daum 금융 (네이버 실패 시 백업)
+        try:
+            url = f"https://finance.daum.net/api/investor/days?symbol={'KOSPI' if market_code == 'KOSPI' else 'KOSDAQ'}"
+            headers = {'Referer': 'https://finance.daum.net', 'User-Agent': 'Mozilla/5.0'}
+            res = requests.get(url, headers=headers, timeout=5).json()
+            # Daum은 일별 데이터 중심이라 시간별 변동은 지수 변동성으로 보정 로직 추가 가능
+            return None
+        except:
+            return None
+
+def get_market_indices():
+    tickers = {'코스피': '^KS11', '코스닥': '^KQ11', '환율': 'KRW=X', '나스닥선물': 'NQ=F'}
     res = {}
     for name, tk in tickers.items():
         try:
             df = yf.download(tk, period="1d", interval="1m", progress=False)
-            if not df.empty:
-                cur = float(df['Close'].iloc[-1])
-                # 30분 전 대비 변동폭 계산
-                prev = float(df['Close'].iloc[-31]) if len(df) > 30 else float(df['Open'].iloc[0])
-                res[name] = {"cur": cur, "diff": round(cur - prev, 2)}
-            else: res[name] = {"cur": 0, "diff": 0}
+            cur = float(df['Close'].iloc[-1])
+            prev = float(df['Close'].iloc[-31]) if len(df) > 30 else float(df['Open'].iloc[0])
+            res[name] = {"cur": cur, "diff": round(cur - prev, 2)}
         except: res[name] = {"cur": 0, "diff": 0}
     return res
 
-def get_investor_backup():
-    """네이버 대신 인베스팅닷컴(Investing.com)의 한국 시장 요약 페이지를 찌릅니다."""
-    # 💡 인베스팅닷컴은 깃허브 IP를 막지 않습니다.
-    url = "https://www.investing.com/indices/south-korea-200-futures-historical-data"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36'
-    }
-    try:
-        # 1안 시도: 인베스팅닷컴 수급 데이터 파싱 (간략화된 로직)
-        # 만약 실제 파싱이 복잡할 경우를 대비해 지수 거래량 비중으로 수급을 추정하는 로직을 섞습니다.
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            # 여기서는 지수의 방향성과 거래 강도를 통해 '외인/기관'의 공격성을 간접 노출합니다.
-            return {"status": "OK", "source": "Investing.com"}
-    except:
-        return {"status": "FAIL"}
-
 def format_message():
-    m = get_market_data()
+    m = get_market_indices()
+    kp_inv = get_investor_data('KOSPI')
+    kd_inv = get_investor_data('KOSDAQ')
+    
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    msg = f"📊 *실시간 수급 변동 브리핑* ({now.strftime('%H:%M')})\n\n"
     
-    # 수급 데이터를 가져오는 2중 장치
-    # 인베스팅닷컴/야후를 통해 실시간 '거래량' 기반으로 수급 강도를 표시합니다.
-    msg = f"📊 *전천후 시장 레이더* ({now.strftime('%H:%M')})\n\n"
-    
-    msg += "📉 *국내 지수 (30분 변동)*\n"
-    msg += f"- 코스피: `{m['KOSPI']['cur']:,.2f}` ({m['KOSPI']['diff']:+.2f})\n"
-    msg += f"- 코스닥: `{m['KOSDAQ']['cur']:,.2f}` ({m['KOSDAQ']['diff']:+.2f})\n\n"
-    
-    msg += "👥 *수급 주체별 동향 (추정치)*\n"
-    # 지수가 빠지는데 환율이 오르면 외인 매도, 지수가 버티면 기관 방어로 표시
-    if m['KOSPI']['diff'] < 0 and m['환율']['diff'] > 0:
-        msg += "⚠️ *외국인 매도세 강함 (환율 상승 동반)*\n"
-    elif m['KOSPI']['diff'] > 0:
-        msg += "✅ *기관/외국인 동반 매수세 유입 중*\n"
-    else:
-        msg += "🟡 *개인 위주의 관망세 지속*\n"
-    
-    msg += "\n🌍 *글로벌 매크로 지표*\n"
-    msg += f"- 원/달러 환율: `{m['환율']['cur']:,.1f}원` ({m['환율']['diff']:+.1f})\n"
-    msg += f"- 나스닥 100 선물: `{m['나스닥선물']['cur']:,.1f}` ({m['나스닥선물']['diff']:+.1f})\n"
-    msg += f"- 공포지수(VIX): `{m['VIX']['cur']:.2f}`\n"
-    msg += f"- 금(Gold): `{m['금']['cur']:,.1f}$`\n\n"
-    
-    msg += "💡 *Note*: 네이버 차단을 피해 해외 금융 서버 데이터를 직접 맵핑했습니다."
+    msg += "📉 *지수 현황*\n"
+    msg += f"- 코스피: `{m['코스피']['cur']:,.2f}` ({m['코스피']['diff']:+.2f})\n"
+    msg += f"- 코스닥: `{m['코스닥']['cur']:,.2f}` ({m['코스닥']['diff']:+.2f})\n\n"
+
+    msg += "👥 *투자자 수급 (단위: 억 / 30분변동 / 1시간변동)*\n"
+    for name, data in [("코스피", kp_inv), ("코스닥", kd_inv)]:
+        msg += f"*[ {name} ]*\n"
+        if data:
+            c, d3, d6 = data['cur'], data['d30'], data['d60']
+            msg += f"- 개인: `{c['retail']:+d}` (`{d3['r']:+d}` / `{d6['r']:+d}`)\n"
+            msg += f"- 외인: `{c['foreign']:+d}` (`{d3['f']:+d}` / `{d6['f']:+d}`)\n"
+            msg += f"- 기관: `{c['inst']:+d}` (`{d3['i']:+d}` / `{d6['i']:+d}`)\n"
+        else:
+            msg += "- 수급 데이터 일시적 차단 (백업 대기 중)\n"
+        msg += "\n"
+
+    msg += "🌍 *글로벌 매크로*\n"
+    msg += f"- 환율: `{m['환율']['cur']:,.1f}원` | 나스닥선물: `{m['나스닥선물']['cur']:,.1f}`"
     
     return msg
 
 if __name__ == "__main__":
-    message = format_message()
-    # 텔레그램 전송
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                  data={'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'})
+    from requests import post
+    post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+         data={'chat_id': CHAT_ID, 'text': format_message(), 'parse_mode': 'Markdown'})
