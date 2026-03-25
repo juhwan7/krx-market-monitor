@@ -1,15 +1,21 @@
 import os
 import datetime
-import urllib.request
+import requests
 import yfinance as yf
-import pandas as pd
-from io import StringIO
 import traceback
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
+# 💡 깃허브 시크릿에서 증권사 API 키 불러오기
+APP_KEY = os.environ.get('HANWHA_APP_KEY')
+APP_SECRET = os.environ.get('HANWHA_APP_SECRET')
+
+# 증권사 API 도메인 (아래는 한국투자증권 실전투자 기준입니다)
+API_BASE_URL = "https://openapi.koreainvestment.com:9443"
+
 def get_yf_data(ticker, name):
+    """야후 파이낸스 매크로 및 지수 데이터 수집 (이전과 동일)"""
     try:
         df = yf.download(ticker, period="1d", interval="1m", progress=False)
         if df.empty:
@@ -30,92 +36,73 @@ def get_yf_data(ticker, name):
     except Exception as e:
         return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": str(e)}
 
-def get_investor_trend_time(biztype, name):
-    """pandas의 read_html을 이용해 네이버의 지저분한 HTML 구조를 무시하고 표만 뜯어옵니다."""
-    records = []
+def get_api_token():
+    """1. 증권사 API 접근용 토큰을 발급받습니다."""
+    if not APP_KEY or not APP_SECRET:
+        return None
+        
+    url = f"{API_BASE_URL}/oauth2/tokenP"
+    headers = {"content-type": "application/json"}
+    body = {
+        "grant_type": "client_credentials", 
+        "appkey": APP_KEY, 
+        "appsecret": APP_SECRET
+    }
+    
+    try:
+        res = requests.post(url, headers=headers, json=body, timeout=5)
+        return res.json().get('access_token')
+    except:
+        return None
+
+def get_investor_trend_api(token, market_code, name):
+    """2. 증권사 API를 호출하여 시간대별 수급 데이터를 가져옵니다."""
+    if not token:
+        return None, f"[{name}] API 토큰 발급 실패 (시크릿 키 등록 확인 필요)"
+        
+    # 🚨 아래 URL과 파라미터는 한국투자증권(KIS) 기준 뼈대입니다.
+    url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor-time"
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://finance.naver.com/'
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": APP_KEY,
+        "appsecret": APP_SECRET,
+        "tr_id": "FHPUP02120000", # 증권사 매뉴얼의 '시간대별 수급 TR 코드' 입력
+        "custtype": "P"
+    }
+    
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "U",
+        "FID_INPUT_ISCD": market_code # 0001(코스피), 1001(코스닥)
     }
 
     try:
-        # 1~8페이지 (약 1시간 20분 분량 넉넉하게 스캔)
-        for page in range(1, 9):
-            url = f"https://finance.naver.com/sise/investorDealTrendTime.naver?biztype={biztype}&page={page}"
-            req = urllib.request.Request(url, headers=headers)
-            
-            response = urllib.request.urlopen(req, timeout=5)
-            html = response.read().decode('euc-kr', errors='ignore')
-            
-            if "error_content" in html or "접근이 제한되었습니다" in html:
-                return None, f"[{name}] WAF 차단됨\n미리보기: {html[:150]}"
-                
-            try:
-                # 💡 핵심: pandas 불도저 파싱 (콤마 자동 제거)
-                dfs = pd.read_html(StringIO(html), thousands=',')
-                df = dfs[0]
-                
-                # '시간' 컬럼이 있는 정상적인 표인지 확인
-                if '시간' in df.columns:
-                    df = df.dropna(subset=['시간']) # 빈 줄(NaN) 제거
-                    for _, row in df.iterrows():
-                        time_str = str(row['시간'])
-                        if ':' in time_str:
-                            # 데이터가 비어있을 경우 0으로 처리하는 안전장치
-                            retail = int(float(row['개인'])) if pd.notna(row['개인']) else 0
-                            foreigner = int(float(row['외국인'])) if pd.notna(row['외국인']) else 0
-                            institution = int(float(row['기관계'])) if pd.notna(row['기관계']) else 0
-                            
-                            records.append({
-                                'time': time_str,
-                                'retail': retail,
-                                'foreigner': foreigner,
-                                'institution': institution
-                            })
-            except ValueError:
-                pass # 해당 페이지에 표가 없으면 무시하고 다음 페이지로
+        res = requests.get(url, headers=headers, params=params, timeout=5)
+        data = res.json()
         
+        if data.get('rt_cd') != '0':
+            return None, f"[{name}] API 자체 에러 반환: {data.get('msg1')}"
+            
+        records = data.get('output', [])
         if not records:
-            return None, f"[{name}] 표 추출 실패 (데이터 없음)\n미리보기: {html[:150]}"
-
-        # 목표 시간 계산 (KST 기준 30분 전, 1시간 전)
-        now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        target_30m = (now - datetime.timedelta(minutes=30)).strftime("%H:%M")
-        target_1h = (now - datetime.timedelta(minutes=60)).strftime("%H:%M")
-
-        # 최신 데이터를 기준으로 과거 데이터를 탐색
-        current = records[0]
+            return None, f"[{name}] 데이터 없음 (장 시작 전)"
+            
+        # =========================================================
+        # 💡 [필독] 여기서부터는 증권사 API 매뉴얼을 보고 키값을 맞춰야 합니다!
+        # JSON 응답 안에 '개인', '외국인' 숫자가 어떤 영문 키값으로 오는지 확인 후
+        # 아래 딕셔너리에 꽂아넣어 주셔야 완벽하게 동작합니다.
+        # =========================================================
         
-        past_30m = current
-        for r in records:
-            if r['time'] <= target_30m:
-                past_30m = r
-                break
-                
-        past_1h = records[-1] if len(records) > 0 else current
-        for r in records:
-            if r['time'] <= target_1h:
-                past_1h = r
-                break
-
         return {
-            "current": current,
-            "diff_30m": {
-                "retail": current['retail'] - past_30m['retail'],
-                "foreigner": current['foreigner'] - past_30m['foreigner'],
-                "institution": current['institution'] - past_30m['institution']
-            },
-            "diff_1h": {
-                "retail": current['retail'] - past_1h['retail'],
-                "foreigner": current['foreigner'] - past_1h['foreigner'],
-                "institution": current['institution'] - past_1h['institution']
-            }
-        }, ""
-
+            "current": {"retail": 0, "foreigner": 0, "institution": 0},
+            "diff_30m": {"retail": 0, "foreigner": 0, "institution": 0},
+            "diff_1h": {"retail": 0, "foreigner": 0, "institution": 0}
+        }, "증권사 JSON 키값 매핑 필요 (하단 설명 참고)"
+        
     except Exception as e:
         error_trace = traceback.format_exc()
-        return None, f"[{name}] 파이썬 실행 오류:\n{error_trace[:200]}"
+        return None, f"[{name}] API 호출 중 파이썬 오류:\n{error_trace[:200]}"
 
 def format_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
@@ -128,14 +115,12 @@ def format_message():
     nq_fut = get_yf_data('NQ=F', '나스닥 100 선물')
     vix = get_yf_data('^VIX', 'VIX (공포지수)')
     
-    gold = get_yf_data('GC=F', '금 선물')
-    oil = get_yf_data('CL=F', 'WTI 원유 선물')
-    copper = get_yf_data('HG=F', '구리 선물')
+    # API 토큰 발급
+    api_token = get_api_token()
     
-    # 수급 데이터 (0:코스피, 1:코스닥, 2:선물)
-    inv_kospi, err_kospi = get_investor_trend_time("0", "코스피")
-    inv_kosdaq, err_kosdaq = get_investor_trend_time("1", "코스닥")
-    inv_fut, err_fut = get_investor_trend_time("2", "선물")
+    # 수급 데이터 호출 (한국투자증권 코드 기준: 0001 코스피, 1001 코스닥)
+    inv_kospi, err_kospi = get_investor_trend_api(api_token, "0001", "코스피")
+    inv_kosdaq, err_kosdaq = get_investor_trend_api(api_token, "1001", "코스닥")
     
     msg = f"📊 *시장 변동성 및 매크로 브리핑* ({time_str})\n\n"
     
@@ -144,34 +129,22 @@ def format_message():
     msg += f"- 코스닥: `{kosdaq['current']:,.2f}` (30분: `{kosdaq['30m_diff']:+.2f}` / 1시간: `{kosdaq['1h_diff']:+.2f}`)\n\n"
     
     msg += "👥 *투자자별 수급 흐름* (현재누적 / 30분변동 / 1시간변동)\n"
-    
-    for name, data in [("코스피", inv_kospi), ("코스닥", inv_kosdaq), ("선  물", inv_fut)]:
+    for name, data in [("코스피", inv_kospi), ("코스닥", inv_kosdaq)]:
         msg += f"*[ {name} ]*\n"
-        if data:
-            unit = "계약" if name == "선  물" else "억"
-            c = data['current']
-            d30 = data['diff_30m']
-            d1h = data['diff_1h']
-            
-            msg += f"- 개인: `{c['retail']:+,d}{unit}` (`{d30['retail']:+,d}` / `{d1h['retail']:+,d}`)\n"
-            msg += f"- 외인: `{c['foreigner']:+,d}{unit}` (`{d30['foreigner']:+,d}` / `{d1h['foreigner']:+,d}`)\n"
-            msg += f"- 기관: `{c['institution']:+,d}{unit}` (`{d30['institution']:+,d}` / `{d1h['institution']:+,d}`)\n"
+        if data and "증권사 JSON" not in err_kospi:
+            c, d30, d1h = data['current'], data['diff_30m'], data['diff_1h']
+            msg += f"- 개인: `{c['retail']:+,d}억` (`{d30['retail']:+,d}` / `{d1h['retail']:+,d}`)\n"
+            msg += f"- 외인: `{c['foreigner']:+,d}억` (`{d30['foreigner']:+,d}` / `{d1h['foreigner']:+,d}`)\n"
+            msg += f"- 기관: `{c['institution']:+,d}억` (`{d30['institution']:+,d}` / `{d1h['institution']:+,d}`)\n\n"
         else:
-            msg += f"- 데이터 수집 실패 (하단 디버깅 로그 참조)\n"
-        msg += "\n"
-        
+            msg += f"- 데이터 수집 실패 (하단 디버깅 로그 참조)\n\n"
+            
     msg += "🌍 *글로벌 매크로 지표* (현재가 / 30분 변동)\n"
     msg += f"- 환율(원/달러): `{usdkrw['current']:,.2f}원` ({usdkrw['30m_diff']:+.2f}원)\n"
     msg += f"- 나스닥 선물: `{nq_fut['current']:,.2f}` ({nq_fut['30m_diff']:+.2f})\n"
-    msg += f"- VIX(공포지수): `{vix['current']:,.2f}` ({vix['30m_diff']:+.2f})\n\n"
-
-    msg += "🛢️ *주요 원자재 변동* (현재가 / 30분 변동)\n"
-    msg += f"- 금(Gold): `{gold['current']:,.2f}$` ({gold['30m_diff']:+.2f}$)\n"
-    msg += f"- WTI 원유: `{oil['current']:,.2f}$` ({oil['30m_diff']:+.2f}$)\n"
-    msg += f"- 구리(Copper): `{copper['current']:,.4f}$` ({copper['30m_diff']:+.4f}$)\n"
+    msg += f"- VIX(공포지수): `{vix['current']:,.2f}` ({vix['30m_diff']:+.2f})\n"
     
-    # 상세 에러 로그 섹션
-    raw_errors = [e for e in [err_kospi, err_kosdaq, err_fut] if e]
+    raw_errors = [e for e in [err_kospi, err_kosdaq] if e]
     if raw_errors:
         msg += "\nㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ\n"
         msg += "🛠️ *상세 오류 디버깅 (Raw Error)*\n```text\n"
