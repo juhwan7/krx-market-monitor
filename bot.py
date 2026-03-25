@@ -1,6 +1,7 @@
 import os
 import datetime
 import urllib.request
+import urllib.error
 import yfinance as yf
 from bs4 import BeautifulSoup
 import traceback
@@ -31,45 +32,52 @@ def get_yf_data(ticker, name):
 
 def get_investor_trend_time(biztype, name):
     records = []
-    
-    # 🚨 핵심: 구글 검색엔진(Googlebot)으로 신분을 위조하여 네이버 방화벽을 무력화시킵니다!
     headers = {
         'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
         'Referer': 'https://www.google.com/'
     }
 
     try:
-        # 1~8페이지 (넉넉히 약 1시간 반 분량) 스캔
-        for page in range(1, 9):
-            url = f"https://finance.naver.com/sise/investorDealTrendTime.naver?biztype={biztype}&page={page}"
-            req = urllib.request.Request(url, headers=headers)
-            
+        # 디버깅을 위해 일단 1페이지 HTML 원본부터 뜯어봅니다.
+        url = f"https://finance.naver.com/sise/investorDealTrendTime.naver?biztype={biztype}&page=1"
+        req = urllib.request.Request(url, headers=headers)
+        
+        try:
             response = urllib.request.urlopen(req, timeout=5)
             html = response.read().decode('euc-kr', errors='ignore')
+            status_code = response.getcode()
+        except urllib.error.HTTPError as e:
+            html = e.read().decode('euc-kr', errors='ignore')
+            status_code = e.code
+            return None, f"[{name}] HTTP 에러 상태코드: {status_code}\n응답 HTML 원본:\n{html[:500]}"
             
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            for tr in soup.find_all('tr'):
-                tds = tr.find_all('td')
-                if len(tds) >= 4:
-                    time_str = tds[0].text.strip()
-                    if ':' in time_str:
-                        try:
-                            retail = int(tds[1].text.strip().replace(',', ''))
-                            foreigner = int(tds[2].text.strip().replace(',', ''))
-                            institution = int(tds[3].text.strip().replace(',', ''))
-                            records.append({
-                                'time': time_str,
-                                'retail': retail,
-                                'foreigner': foreigner,
-                                'institution': institution
-                            })
-                        except:
-                            pass
+        soup = BeautifulSoup(html, 'html.parser')
         
+        for tr in soup.find_all('tr'):
+            tds = tr.find_all('td')
+            if len(tds) >= 4:
+                time_str = tds[0].text.strip()
+                if ':' in time_str:
+                    try:
+                        retail = int(tds[1].text.strip().replace(',', ''))
+                        foreigner = int(tds[2].text.strip().replace(',', ''))
+                        institution = int(tds[3].text.strip().replace(',', ''))
+                        records.append({
+                            'time': time_str,
+                            'retail': retail,
+                            'foreigner': foreigner,
+                            'institution': institution
+                        })
+                    except:
+                        pass
+        
+        # 💡 핵심 디버깅: 표를 못 찾았을 경우, 상태코드와 네이버가 준 HTML 500글자를 그대로 던집니다.
         if not records:
-            return None, f"[{name}] 데이터 파싱 실패 (구글봇 위장 후에도 표를 못 찾음)"
+            return None, f"[{name}] 표를 찾을 수 없음! (상태코드: {status_code})\n응답 HTML 원본:\n{html[:500]}"
 
+        # 이 아래는 1페이지 파싱 성공 시 나머지 페이지 긁는 로직 (일단 보류)
+        # 디버깅 중이므로 첫 페이지만 처리하여 테스트합니다.
+        
         now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
         target_30m = (now - datetime.timedelta(minutes=30)).strftime("%H:%M")
         target_1h = (now - datetime.timedelta(minutes=60)).strftime("%H:%M")
@@ -110,21 +118,17 @@ def format_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     time_str = now.strftime("%Y-%m-%d %H:%M 기준")
     
-    # 1. 국내 지수
     kospi = get_yf_data('^KS11', 'KOSPI')
     kosdaq = get_yf_data('^KQ11', 'KOSDAQ')
     
-    # 2. 글로벌 매크로 지표
     usdkrw = get_yf_data('KRW=X', '원/달러 환율')
     nq_fut = get_yf_data('NQ=F', '나스닥 100 선물')
     vix = get_yf_data('^VIX', 'VIX (공포지수)')
     
-    # 3. 원자재
     gold = get_yf_data('GC=F', '금 선물')
     oil = get_yf_data('CL=F', 'WTI 원유 선물')
     copper = get_yf_data('HG=F', '구리 선물')
     
-    # 4. 시간대별 투자자 수급 (0:코스피, 1:코스닥, 2:선물)
     inv_kospi, err_kospi = get_investor_trend_time("0", "코스피")
     inv_kosdaq, err_kosdaq = get_investor_trend_time("1", "코스닥")
     inv_fut, err_fut = get_investor_trend_time("2", "선물")
