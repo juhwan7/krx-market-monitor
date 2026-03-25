@@ -1,9 +1,11 @@
 name: Market Telegram Bot
 
 on:
+  push:
+    branches: [ "main", "master" ]  # 💡 코드를 전송(Commit)하면 즉시 실행!
   schedule:
-    - cron: '*/30 0-6 * * 1-5'
-  workflow_dispatch:
+    - cron: '*/30 0-6 * * 1-5'      # 평일 30분마다 실행
+  workflow_dispatch:                # 수동 버튼 실행
 
 jobs:
   build:
@@ -11,10 +13,10 @@ jobs:
 
     steps:
     - name: 저장소 체크아웃
-      uses: actions/checkout@v4  # 👈 v3에서 v4로 변경
+      uses: actions/checkout@v4
 
     - name: 파이썬 환경 설정
-      uses: actions/setup-python@v5  # 👈 v4에서 v5로 변경
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
