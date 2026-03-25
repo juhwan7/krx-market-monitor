@@ -2,36 +2,35 @@ import requests
 from bs4 import BeautifulSoup
 import datetime
 import os
+import time  # 💡 사람처럼 쉬어주는 기능 추가
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
-# 💡 핵심: 네이버의 봇 차단을 뚫기 위해 완벽한 사람(일반 브라우저)으로 위장합니다.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-    "Referer": "https://finance.naver.com/sise/"
+    "Referer": "https://finance.naver.com/"
 }
 
 def get_index_data(code):
     prices = []
     error_msg = ""
     
-    # 넉넉하게 15페이지(약 1시간 반 분량) 스캔
-    for page in range(1, 15):
+    # 💡 무식하게 다 찾지 않고 딱 현재(1), 30분전(6), 1시간전(11) 페이지만 스나이핑
+    target_pages = [1, 6, 11]
+    
+    for page in target_pages:
         url = f"https://finance.naver.com/sise/sise_index_time.naver?code={code}&page={page}"
         try:
             res = requests.get(url, headers=HEADERS, timeout=5)
             res.encoding = 'euc-kr'
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # 파싱 전략 1: 명확한 클래스명으로 찾기
             dates = soup.find_all('td', class_='date')
             numbers = soup.find_all('td', class_='number_1')
             
             if dates and len(numbers) >= len(dates):
-                ratio = len(numbers) // len(dates) # 한 줄에 숫자가 몇 개씩 있는지 비율 계산
+                ratio = len(numbers) // len(dates)
                 for i in range(len(dates)):
                     time_str = dates[i].text.strip()
                     price_str = numbers[i * ratio].text.strip().replace(',', '')
@@ -40,33 +39,23 @@ def get_index_data(code):
                             prices.append({'time': time_str, 'price': float(price_str)})
                         except:
                             pass
-            else:
-                # 파싱 전략 2: 만약 테이블 구조가 깨졌다면 무식하게 모든 줄(tr)을 뒤져서 찾기
-                for row in soup.find_all('tr'):
-                    cols = row.find_all('td')
-                    if len(cols) >= 2 and ':' in cols[0].text: # 첫 칸이 시간(HH:MM) 형태면 체결가로 간주
-                        time_str = cols[0].text.strip()
-                        price_str = cols[1].text.strip().replace(',', '')
-                        try:
-                            prices.append({'time': time_str, 'price': float(price_str)})
-                        except:
-                            pass
+            
+            # 🚨 핵심: 네이버가 봇으로 인식하지 못하도록 1.5초 대기 (사람인 척 연기)
+            time.sleep(1.5)
+            
         except Exception as e:
-            error_msg = f"페이지 파싱 중 에러({page}): {e}"
+            error_msg = f"{page}페이지 파싱 에러"
             break
 
-    # 데이터를 아예 못 가져왔을 때의 안전장치
     if not prices:
-        return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": error_msg or "네이버 접속 차단됨 (데이터 없음)"}
+        return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": error_msg or "네이버 차단됨"}
 
     current_price = prices[0]['price']
     
-    # 현재 KST 시간 기준으로 30분전, 1시간전 목표 시간 계산
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     target_30m = (now - datetime.timedelta(minutes=30)).strftime("%H:%M")
     target_1h = (now - datetime.timedelta(minutes=60)).strftime("%H:%M")
 
-    # 과거 가격 탐색 (가장 가까운 과거 시점의 가격 매칭)
     price_30m = current_price
     for p in prices:
         if p['time'] <= target_30m:
@@ -87,6 +76,7 @@ def get_index_data(code):
     }
 
 def get_program_data():
+    time.sleep(1) # 프로그램 데이터 가기 전에도 1초 휴식
     url = "https://finance.naver.com/sise/sise_program.naver"
     kospi_val = 0
     kosdaq_val = 0
@@ -97,7 +87,6 @@ def get_program_data():
         res.encoding = 'euc-kr'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 페이지 내의 모든 표(table)를 뒤져서 '거래소', '코스닥' 글자가 있는 줄을 악착같이 찾음
         for table in soup.find_all('table'):
             for row in table.find_all('tr'):
                 cols = row.find_all(['th', 'td'])
@@ -106,7 +95,7 @@ def get_program_data():
                     
                     if '거래소' in texts[0] or '코스피' in texts[0]:
                         try:
-                            kospi_val = round(int(texts[6]) / 100) # 7번째 칸(인덱스 6)이 비차익 순매수
+                            kospi_val = round(int(texts[6]) / 100)
                         except:
                             pass
                     elif '코스닥' in texts[0]:
@@ -137,16 +126,15 @@ def format_message():
     msg += f"- 코스피: `{program_data['KOSPI']:+,d}억`\n"
     msg += f"- 코스닥: `{program_data['KOSDAQ']:+,d}억`\n"
     
-    # 에러가 발생했을 때 텔레그램 메시지 하단에 원인 출력
     errors = []
     if kospi_data.get('error'): errors.append(f"코스피: {kospi_data['error']}")
     if kosdaq_data.get('error'): errors.append(f"코스닥: {kosdaq_data['error']}")
     if program_data.get('error'): errors.append(f"프로그램: {program_data['error']}")
     
     if errors:
-        msg += "\n⚠️ *데이터 수집 실패 알림*\n" + "\n".join(errors)
+        msg += "\n⚠️ *데이터 수집 실패*\n" + "\n".join(errors)
     else:
-        msg += "\n💡 프로그램 매도 폭탄이 떨어질 때가 눌림목 기회일 수 있습니다!"
+        msg += "\n💡 프로그램 매도 폭탄이 떨어질 때가 눌림 타점의 기회일 수 있습니다!"
         
     return msg
 
@@ -162,4 +150,3 @@ def send_telegram(message):
 if __name__ == "__main__":
     message = format_message()
     send_telegram(message)
-    print("텔레그램 메시지 전송 완료!")
