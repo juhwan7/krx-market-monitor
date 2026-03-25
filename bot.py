@@ -1,39 +1,26 @@
 import os
 import datetime
-import urllib.request
 import yfinance as yf
-import pandas as pd
-from bs4 import BeautifulSoup
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
-debug_logs = []
 
-def get_index_data_yf(ticker, name):
-    """야후 파이낸스를 이용해 지수 1분봉 데이터를 가져옵니다. (방화벽 절대 안막힘)"""
-    debug_logs.append(f"\n🔍 [{name} 지수 추적 (Yahoo Finance)]")
+def get_yf_data(ticker, name):
+    """야후 파이낸스를 이용해 지수, 환율, 선물, 원자재 데이터를 수집합니다."""
     try:
-        # 야후 파이낸스 KOSPI: ^KS11, KOSDAQ: ^KQ11
         df = yf.download(ticker, period="1d", interval="1m", progress=False)
         
         if df.empty:
-            debug_logs.append("└ ❌ 데이터 없음 (휴장일이거나 장 시작 전)")
             return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": "데이터 없음"}
             
-        debug_logs.append(f"└ 1분봉 데이터 {len(df)}개 확보 성공")
-        
-        # 종가(Close) 리스트 추출
         closes = df['Close'].dropna().values
         current_price = float(closes[-1])
         
-        # 30분 전(30개 전), 1시간 전(60개 전) 가격
         idx_30m = -31 if len(closes) > 30 else 0
         idx_1h = -61 if len(closes) > 60 else 0
         
         price_30m = float(closes[idx_30m])
         price_1h = float(closes[idx_1h])
-        
-        debug_logs.append(f"└ 매칭 완료 (현재:{current_price:.2f}, 30분전:{price_30m:.2f})")
         
         return {
             "current": current_price,
@@ -42,92 +29,54 @@ def get_index_data_yf(ticker, name):
             "error": ""
         }
     except Exception as e:
-        debug_logs.append(f"└ 💥 야후 파이낸스 에러: {e}")
-        return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": "야후 API 에러"}
-
-def get_program_data():
-    """urllib 모듈을 활용해 브라우저 엔진 레벨로 위장하여 네이버 방화벽을 찌릅니다."""
-    debug_logs.append(f"\n🔍 [프로그램 매매 추적 (urllib 위장)]")
-    url = "https://finance.naver.com/sise/sise_program.naver"
-    kospi_val = 0
-    kosdaq_val = 0
-    error_msg = ""
-    
-    # requests 모듈 특유의 흔적을 지우고 urllib으로 직접 요청
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Referer': 'https://finance.naver.com/'
-    })
-    
-    try:
-        response = urllib.request.urlopen(req, timeout=10)
-        html = response.read().decode('euc-kr', errors='ignore')
-        debug_logs.append(f"└ 상태코드: {response.getcode()}")
-        
-        soup = BeautifulSoup(html, 'html.parser')
-        tables = soup.find_all('table')
-        
-        found = False
-        for table in tables:
-            for row in table.find_all('tr'):
-                cols = row.find_all(['th', 'td'])
-                if len(cols) >= 7:
-                    texts = [c.text.strip().replace(',', '') for c in cols]
-                    if '거래소' in texts[0] or '코스피' in texts[0]:
-                        try:
-                            kospi_val = round(int(texts[6]) / 100)
-                            found = True
-                        except: pass
-                    elif '코스닥' in texts[0]:
-                        try:
-                            kosdaq_val = round(int(texts[6]) / 100)
-                            found = True
-                        except: pass
-                        
-        if found:
-            debug_logs.append(f"└ 뚫기 성공! 코스피 {kospi_val}억, 코스닥 {kosdaq_val}억")
-        else:
-            debug_logs.append("└ ❌ 테이블은 읽었으나 데이터 구조가 다름 (WAF 방어막일 확률 높음)")
-            error_msg = "프로그램 데이터 파싱 실패"
-            
-    except Exception as e:
-        debug_logs.append(f"└ 💥 접속 에러 발생: {e}")
-        error_msg = "네이버 접속 완전 차단됨"
-
-    return {"KOSPI": kospi_val, "KOSDAQ": kosdaq_val, "error": error_msg}
+        return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": str(e)}
 
 def format_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     time_str = now.strftime("%Y-%m-%d %H:%M 기준")
     
-    # 야후 파이낸스 티커 입력
-    kospi_data = get_index_data_yf('^KS11', 'KOSPI')
-    kosdaq_data = get_index_data_yf('^KQ11', 'KOSDAQ')
-    program_data = get_program_data()
+    # 1. 국내 지수
+    kospi = get_yf_data('^KS11', 'KOSPI')
+    kosdaq = get_yf_data('^KQ11', 'KOSDAQ')
     
-    msg = f"📊 *시장 변동성 및 수급 브리핑* ({time_str})\n\n"
+    # 2. 글로벌 매크로 지표
+    usdkrw = get_yf_data('KRW=X', '원/달러 환율')
+    nq_fut = get_yf_data('NQ=F', '나스닥 100 선물')
+    vix = get_yf_data('^VIX', 'VIX (공포지수)')
     
-    msg += "📉 *지수 변동* (현재가 / 30분 / 1시간)\n"
-    msg += f"- 코스피: `{kospi_data['current']:,.2f}` (30분: `{kospi_data['30m_diff']:+.2f}` / 1시간: `{kospi_data['1h_diff']:+.2f}`)\n"
-    msg += f"- 코스닥: `{kosdaq_data['current']:,.2f}` (30분: `{kosdaq_data['30m_diff']:+.2f}` / 1시간: `{kosdaq_data['1h_diff']:+.2f}`)\n\n"
+    # 3. 주요 원자재 (추가됨)
+    # GC=F(금 선물), CL=F(WTI 원유 선물), HG=F(구리 선물)
+    gold = get_yf_data('GC=F', '금 선물')
+    oil = get_yf_data('CL=F', 'WTI 원유 선물')
+    copper = get_yf_data('HG=F', '구리 선물')
     
-    msg += "🤖 *비차익 프로그램 누적* (단위: 억원)\n"
-    msg += f"- 코스피: `{program_data['KOSPI']:+,d}억`\n"
-    msg += f"- 코스닥: `{program_data['KOSDAQ']:+,d}억`\n"
+    msg = f"📊 *시장 변동성 및 매크로 브리핑* ({time_str})\n\n"
+    
+    msg += "📉 *국내 지수 변동* (현재가 / 30분 / 1시간)\n"
+    msg += f"- 코스피: `{kospi['current']:,.2f}` (30분: `{kospi['30m_diff']:+.2f}` / 1시간: `{kospi['1h_diff']:+.2f}`)\n"
+    msg += f"- 코스닥: `{kosdaq['current']:,.2f}` (30분: `{kosdaq['30m_diff']:+.2f}` / 1시간: `{kosdaq['1h_diff']:+.2f}`)\n\n"
+    
+    msg += "🌍 *글로벌 매크로 지표* (현재가 / 30분 변동)\n"
+    msg += f"- 환율(원/달러): `{usdkrw['current']:,.2f}원` ({usdkrw['30m_diff']:+.2f}원)\n"
+    msg += f"- 나스닥 선물: `{nq_fut['current']:,.2f}` ({nq_fut['30m_diff']:+.2f})\n"
+    msg += f"- VIX(공포지수): `{vix['current']:,.2f}` ({vix['30m_diff']:+.2f})\n\n"
+
+    msg += "🛢️ *주요 원자재 변동* (현재가 / 30분 변동)\n"
+    msg += f"- 금(Gold): `{gold['current']:,.2f}$` ({gold['30m_diff']:+.2f}$)\n"
+    msg += f"- WTI 원유: `{oil['current']:,.2f}$` ({oil['30m_diff']:+.2f}$)\n"
+    msg += f"- 구리(Copper): `{copper['current']:,.4f}$` ({copper['30m_diff']:+.4f}$)\n\n"
+    
+    msg += "💡 *매매 Tip*: 매크로가 안정적인데 지수만 빠지면 좋은 눌림 타점입니다. 단, 금이나 원유의 급등, 혹은 환율 상승은 위험 회피 신호이니 비중을 조절하세요!\n"
     
     errors = []
-    if kospi_data.get('error'): errors.append(f"코스피: {kospi_data['error']}")
-    if kosdaq_data.get('error'): errors.append(f"코스닥: {kosdaq_data['error']}")
-    if program_data.get('error'): errors.append(f"프로그램: {program_data['error']}")
-    
+    for d, name in zip(
+        [kospi, kosdaq, usdkrw, nq_fut, vix, gold, oil, copper], 
+        ['코스피', '코스닥', '환율', '나스닥선물', 'VIX', '금', '원유', '구리']
+    ):
+        if d.get('error'): errors.append(f"{name}: {d['error']}")
+        
     if errors:
         msg += "\n⚠️ *일부 데이터 수집 실패*\n" + "\n".join(errors)
-    
-    msg += "\nㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ\n"
-    msg += "🛠️ *상세 디버깅 로그 (CCTV)*\n```text"
-    msg += "\n".join(debug_logs)
-    msg += "\n```"
         
     return msg
 
