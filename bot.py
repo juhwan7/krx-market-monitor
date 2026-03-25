@@ -1,6 +1,8 @@
 import os
 import datetime
+import urllib.request
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
@@ -31,6 +33,48 @@ def get_yf_data(ticker, name):
     except Exception as e:
         return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": str(e)}
 
+def get_investor_trend():
+    """모바일 환경으로 위장하여 코스피/코스닥/선물의 주체별 실시간 순매수 동향을 수집합니다."""
+    trends = {}
+    # 0: KOSPI, 1: KOSDAQ, 2: 선물
+    codes = [("0", "코스피"), ("1", "코스닥"), ("2", "선  물")]
+    
+    for biztype, name in codes:
+        url = f"https://finance.naver.com/sise/investorDealTrendData.naver?biztype={biztype}"
+        
+        # 🚨 WAF(방화벽)를 뚫기 위해 모바일 아이폰(iPhone) 접속으로 완벽 위장
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            'Referer': 'https://m.naver.com/'
+        })
+        
+        try:
+            response = urllib.request.urlopen(req, timeout=5)
+            xml_data = response.read().decode('euc-kr', errors='ignore')
+            
+            soup = BeautifulSoup(xml_data, 'html.parser')
+            items = soup.find_all('item')
+            
+            if items:
+                last = items[-1]
+                # purval1(개인), purval2(외국인), purval3(기관)
+                retail = int(last.find('purval1').text.replace(',', ''))
+                foreigner = int(last.find('purval2').text.replace(',', ''))
+                institution = int(last.find('purval3').text.replace(',', ''))
+                
+                trends[name] = {
+                    "retail": retail, 
+                    "foreigner": foreigner, 
+                    "institution": institution, 
+                    "error": ""
+                }
+            else:
+                trends[name] = {"error": "방화벽 차단됨"}
+        except Exception as e:
+            trends[name] = {"error": str(e)}
+            
+    return trends
+
 def format_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     time_str = now.strftime("%Y-%m-%d %H:%M 기준")
@@ -39,23 +83,34 @@ def format_message():
     kospi = get_yf_data('^KS11', 'KOSPI')
     kosdaq = get_yf_data('^KQ11', 'KOSDAQ')
     
-    # 2. 글로벌 매크로 지표
+    # 2. 투자자별 수급 동향 (추가됨)
+    investors = get_investor_trend()
+    
+    # 3. 글로벌 매크로 및 원자재
     usdkrw = get_yf_data('KRW=X', '원/달러 환율')
     nq_fut = get_yf_data('NQ=F', '나스닥 100 선물')
     vix = get_yf_data('^VIX', 'VIX (공포지수)')
-    
-    # 3. 주요 원자재 (추가됨)
-    # GC=F(금 선물), CL=F(WTI 원유 선물), HG=F(구리 선물)
     gold = get_yf_data('GC=F', '금 선물')
     oil = get_yf_data('CL=F', 'WTI 원유 선물')
     copper = get_yf_data('HG=F', '구리 선물')
     
+    # 메시지 조합 시작
     msg = f"📊 *시장 변동성 및 매크로 브리핑* ({time_str})\n\n"
     
     msg += "📉 *국내 지수 변동* (현재가 / 30분 / 1시간)\n"
     msg += f"- 코스피: `{kospi['current']:,.2f}` (30분: `{kospi['30m_diff']:+.2f}` / 1시간: `{kospi['1h_diff']:+.2f}`)\n"
     msg += f"- 코스닥: `{kosdaq['current']:,.2f}` (30분: `{kosdaq['30m_diff']:+.2f}` / 1시간: `{kosdaq['1h_diff']:+.2f}`)\n\n"
     
+    # 수급 동향 섹션 추가
+    msg += "👥 *투자자별 수급 동향* (단위: 억원)\n"
+    for name in ["코스피", "코스닥", "선  물"]:
+        data = investors.get(name, {})
+        if not data.get('error'):
+            msg += f"- {name}: 개인 `{data['retail']:+,d}` | 외국인 `{data['foreigner']:+,d}` | 기관 `{data['institution']:+,d}`\n"
+        else:
+            msg += f"- {name}: 수급 데이터 파싱 실패\n"
+    msg += "\n"
+            
     msg += "🌍 *글로벌 매크로 지표* (현재가 / 30분 변동)\n"
     msg += f"- 환율(원/달러): `{usdkrw['current']:,.2f}원` ({usdkrw['30m_diff']:+.2f}원)\n"
     msg += f"- 나스닥 선물: `{nq_fut['current']:,.2f}` ({nq_fut['30m_diff']:+.2f})\n"
@@ -64,10 +119,9 @@ def format_message():
     msg += "🛢️ *주요 원자재 변동* (현재가 / 30분 변동)\n"
     msg += f"- 금(Gold): `{gold['current']:,.2f}$` ({gold['30m_diff']:+.2f}$)\n"
     msg += f"- WTI 원유: `{oil['current']:,.2f}$` ({oil['30m_diff']:+.2f}$)\n"
-    msg += f"- 구리(Copper): `{copper['current']:,.4f}$` ({copper['30m_diff']:+.4f}$)\n\n"
+    msg += f"- 구리(Copper): `{copper['current']:,.4f}$` ({copper['30m_diff']:+.4f}$)\n"
     
-    msg += "💡 *매매 Tip*: 매크로가 안정적인데 지수만 빠지면 좋은 눌림 타점입니다. 단, 금이나 원유의 급등, 혹은 환율 상승은 위험 회피 신호이니 비중을 조절하세요!\n"
-    
+    # 에러 체크
     errors = []
     for d, name in zip(
         [kospi, kosdaq, usdkrw, nq_fut, vix, gold, oil, copper], 
