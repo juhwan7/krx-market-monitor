@@ -29,4 +29,6 @@ jobs:
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
+        HANWHA_APP_KEY: ${{ secrets.HANWHA_APP_KEY }}
+        HANWHA_APP_SECRET: ${{ secrets.HANWHA_APP_SECRET }}
       run: python bot.py
