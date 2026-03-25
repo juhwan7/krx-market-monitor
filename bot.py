@@ -2,7 +2,8 @@ import os
 import datetime
 import urllib.request
 import yfinance as yf
-from bs4 import BeautifulSoup
+import pandas as pd
+from io import StringIO
 import traceback
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
@@ -30,19 +31,17 @@ def get_yf_data(ticker, name):
         return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": str(e)}
 
 def get_investor_trend_time(biztype, name):
-    """네이버 시간별 수급 동향을 가져와 현재/30분/1시간 전을 비교합니다."""
-    # biztype: 0(코스피), 1(코스닥), 2(선물)
+    """pandas의 read_html을 이용해 네이버의 지저분한 HTML 구조를 무시하고 표만 뜯어옵니다."""
     records = []
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Referer': 'https://finance.naver.com/'
     }
 
     try:
-        # 1~6페이지 (약 1.5시간 분량) 스캔
-        for page in range(1, 7):
+        # 1~8페이지 (약 1시간 20분 분량 넉넉하게 스캔)
+        for page in range(1, 9):
             url = f"https://finance.naver.com/sise/investorDealTrendTime.naver?biztype={biztype}&page={page}"
             req = urllib.request.Request(url, headers=headers)
             
@@ -50,37 +49,42 @@ def get_investor_trend_time(biztype, name):
             html = response.read().decode('euc-kr', errors='ignore')
             
             if "error_content" in html or "접근이 제한되었습니다" in html:
-                return None, f"[{name}] WAF 차단됨 (에러페이지 반환)\n미리보기: {html[:150]}"
+                return None, f"[{name}] WAF 차단됨\n미리보기: {html[:150]}"
                 
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            for tr in soup.find_all('tr'):
-                tds = tr.find_all('td')
-                if len(tds) >= 4:
-                    time_str = tds[0].text.strip()
-                    if ':' in time_str:
-                        try:
-                            # 개인, 외국인, 기관 순매수 추출
-                            retail = int(tds[1].text.strip().replace(',', ''))
-                            foreigner = int(tds[2].text.strip().replace(',', ''))
-                            institution = int(tds[3].text.strip().replace(',', ''))
+            try:
+                # 💡 핵심: pandas 불도저 파싱 (콤마 자동 제거)
+                dfs = pd.read_html(StringIO(html), thousands=',')
+                df = dfs[0]
+                
+                # '시간' 컬럼이 있는 정상적인 표인지 확인
+                if '시간' in df.columns:
+                    df = df.dropna(subset=['시간']) # 빈 줄(NaN) 제거
+                    for _, row in df.iterrows():
+                        time_str = str(row['시간'])
+                        if ':' in time_str:
+                            # 데이터가 비어있을 경우 0으로 처리하는 안전장치
+                            retail = int(float(row['개인'])) if pd.notna(row['개인']) else 0
+                            foreigner = int(float(row['외국인'])) if pd.notna(row['외국인']) else 0
+                            institution = int(float(row['기관계'])) if pd.notna(row['기관계']) else 0
+                            
                             records.append({
                                 'time': time_str,
                                 'retail': retail,
                                 'foreigner': foreigner,
                                 'institution': institution
                             })
-                        except:
-                            pass
+            except ValueError:
+                pass # 해당 페이지에 표가 없으면 무시하고 다음 페이지로
         
         if not records:
-            return None, f"[{name}] 데이터 파싱 실패 (구조 다름)\n미리보기: {html[:150]}"
+            return None, f"[{name}] 표 추출 실패 (데이터 없음)\n미리보기: {html[:150]}"
 
-        # 시간 매칭
+        # 목표 시간 계산 (KST 기준 30분 전, 1시간 전)
         now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
         target_30m = (now - datetime.timedelta(minutes=30)).strftime("%H:%M")
         target_1h = (now - datetime.timedelta(minutes=60)).strftime("%H:%M")
 
+        # 최신 데이터를 기준으로 과거 데이터를 탐색
         current = records[0]
         
         past_30m = current
