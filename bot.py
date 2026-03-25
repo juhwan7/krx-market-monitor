@@ -7,15 +7,14 @@ import traceback
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
-# 💡 깃허브 시크릿에서 증권사 API 키 불러오기
+# 깃허브 시크릿에서 한화투자증권 API 키 불러오기
 APP_KEY = os.environ.get('HANWHA_APP_KEY')
 APP_SECRET = os.environ.get('HANWHA_APP_SECRET')
 
-# 증권사 API 도메인 (아래는 한국투자증권 실전투자 기준입니다)
+# 🚨 현재 목적지는 한국투자증권입니다. (한화 매뉴얼을 보고 수정해야 함!)
 API_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 def get_yf_data(ticker, name):
-    """야후 파이낸스 매크로 및 지수 데이터 수집 (이전과 동일)"""
     try:
         df = yf.download(ticker, period="1d", interval="1m", progress=False)
         if df.empty:
@@ -37,9 +36,8 @@ def get_yf_data(ticker, name):
         return {"current": 0.0, "30m_diff": 0.0, "1h_diff": 0.0, "error": str(e)}
 
 def get_api_token():
-    """1. 증권사 API 접근용 토큰을 발급받습니다."""
     if not APP_KEY or not APP_SECRET:
-        return None
+        return None, "시크릿 키(HANWHA_APP_KEY 등)가 깃허브에 등록되지 않았습니다."
         
     url = f"{API_BASE_URL}/oauth2/tokenP"
     headers = {"content-type": "application/json"}
@@ -51,16 +49,19 @@ def get_api_token():
     
     try:
         res = requests.post(url, headers=headers, json=body, timeout=5)
-        return res.json().get('access_token')
-    except:
-        return None
+        # 💡 JSON 파싱 에러(complexjson)를 잡기 위한 방어벽
+        try:
+            data = res.json()
+            return data.get('access_token'), ""
+        except Exception:
+            return None, f"토큰 발급 실패 (JSON 아님)\n상태코드: {res.status_code}\n응답 텍스트: {res.text[:150]}"
+    except Exception as e:
+        return None, f"토큰 요청 네트워크 에러: {e}"
 
 def get_investor_trend_api(token, market_code, name):
-    """2. 증권사 API를 호출하여 시간대별 수급 데이터를 가져옵니다."""
     if not token:
-        return None, f"[{name}] API 토큰 발급 실패 (시크릿 키 등록 확인 필요)"
+        return None, f"[{name}] API 토큰이 없어 실행 불가"
         
-    # 🚨 아래 URL과 파라미터는 한국투자증권(KIS) 기준 뼈대입니다.
     url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-investor-time"
     
     headers = {
@@ -68,41 +69,32 @@ def get_investor_trend_api(token, market_code, name):
         "authorization": f"Bearer {token}",
         "appkey": APP_KEY,
         "appsecret": APP_SECRET,
-        "tr_id": "FHPUP02120000", # 증권사 매뉴얼의 '시간대별 수급 TR 코드' 입력
+        "tr_id": "FHPUP02120000", 
         "custtype": "P"
     }
     
     params = {
         "FID_COND_MRKT_DIV_CODE": "U",
-        "FID_INPUT_ISCD": market_code # 0001(코스피), 1001(코스닥)
+        "FID_INPUT_ISCD": market_code 
     }
 
     try:
         res = requests.get(url, headers=headers, params=params, timeout=5)
-        data = res.json()
         
+        # 💡 HTML 에러 페이지를 JSON으로 읽다가 파이썬이 뻗는 현상 완벽 차단!
+        try:
+            data = res.json()
+        except Exception:
+            return None, f"[{name}] 서버가 에러를 뱉었습니다 (JSON 아님)\n상태코드: {res.status_code}\n응답 원본: {res.text[:150]}"
+            
         if data.get('rt_cd') != '0':
             return None, f"[{name}] API 자체 에러 반환: {data.get('msg1')}"
             
-        records = data.get('output', [])
-        if not records:
-            return None, f"[{name}] 데이터 없음 (장 시작 전)"
-            
-        # =========================================================
-        # 💡 [필독] 여기서부터는 증권사 API 매뉴얼을 보고 키값을 맞춰야 합니다!
-        # JSON 응답 안에 '개인', '외국인' 숫자가 어떤 영문 키값으로 오는지 확인 후
-        # 아래 딕셔너리에 꽂아넣어 주셔야 완벽하게 동작합니다.
-        # =========================================================
-        
-        return {
-            "current": {"retail": 0, "foreigner": 0, "institution": 0},
-            "diff_30m": {"retail": 0, "foreigner": 0, "institution": 0},
-            "diff_1h": {"retail": 0, "foreigner": 0, "institution": 0}
-        }, "증권사 JSON 키값 매핑 필요 (하단 설명 참고)"
+        return None, "증권사 JSON 키값 매핑 필요 (한화 매뉴얼 확인 필요)"
         
     except Exception as e:
         error_trace = traceback.format_exc()
-        return None, f"[{name}] API 호출 중 파이썬 오류:\n{error_trace[:200]}"
+        return None, f"[{name}] 파이썬 실행 오류:\n{error_trace[:150]}"
 
 def format_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
@@ -115,10 +107,14 @@ def format_message():
     nq_fut = get_yf_data('NQ=F', '나스닥 100 선물')
     vix = get_yf_data('^VIX', 'VIX (공포지수)')
     
-    # API 토큰 발급
-    api_token = get_api_token()
+    gold = get_yf_data('GC=F', '금 선물')
+    oil = get_yf_data('CL=F', 'WTI 원유 선물')
+    copper = get_yf_data('HG=F', '구리 선물')
     
-    # 수급 데이터 호출 (한국투자증권 코드 기준: 0001 코스피, 1001 코스닥)
+    # API 토큰 발급
+    api_token, token_err = get_api_token()
+    
+    # 수급 데이터 호출
     inv_kospi, err_kospi = get_investor_trend_api(api_token, "0001", "코스피")
     inv_kosdaq, err_kosdaq = get_investor_trend_api(api_token, "1001", "코스닥")
     
@@ -131,7 +127,7 @@ def format_message():
     msg += "👥 *투자자별 수급 흐름* (현재누적 / 30분변동 / 1시간변동)\n"
     for name, data in [("코스피", inv_kospi), ("코스닥", inv_kosdaq)]:
         msg += f"*[ {name} ]*\n"
-        if data and "증권사 JSON" not in err_kospi:
+        if data:
             c, d30, d1h = data['current'], data['diff_30m'], data['diff_1h']
             msg += f"- 개인: `{c['retail']:+,d}억` (`{d30['retail']:+,d}` / `{d1h['retail']:+,d}`)\n"
             msg += f"- 외인: `{c['foreigner']:+,d}억` (`{d30['foreigner']:+,d}` / `{d1h['foreigner']:+,d}`)\n"
@@ -144,7 +140,8 @@ def format_message():
     msg += f"- 나스닥 선물: `{nq_fut['current']:,.2f}` ({nq_fut['30m_diff']:+.2f})\n"
     msg += f"- VIX(공포지수): `{vix['current']:,.2f}` ({vix['30m_diff']:+.2f})\n"
     
-    raw_errors = [e for e in [err_kospi, err_kosdaq] if e]
+    # 💡 에러 로그 통합 출력
+    raw_errors = [e for e in [token_err, err_kospi, err_kosdaq] if e]
     if raw_errors:
         msg += "\nㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ\n"
         msg += "🛠️ *상세 오류 디버깅 (Raw Error)*\n```text\n"
